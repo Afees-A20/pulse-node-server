@@ -56,10 +56,14 @@ let isShuttingDown = false;
 
 
 // MIDDLEWARE
+// CORS
 app.use(cors({
-  origin: "http://localhost:5173",
+  origin: [
+    "http://localhost:5173",
+    "https://pulsenode-client.vercel.app"
+  ],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
 app.use(helmet());

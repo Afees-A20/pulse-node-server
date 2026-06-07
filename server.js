@@ -1,41 +1,43 @@
 require("dotenv").config();
 
-
 // ENV VALIDATION
-
 const CONTROL_PASSWORD = process.env.CONTROL_PASSWORD;
+const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!CONTROL_PASSWORD) {
   throw new Error("CONTROL_PASSWORD missing in .env file");
 }
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET missing in .env file");
+}
 
 // CORE IMPORTS
-
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
+const jwt = require("jsonwebtoken");
 
 const swaggerUi = require("swagger-ui-express");
 const swaggerSpec = require("./config/swagger");
 
 const telemetryRoutes = require("./routes/telemetryRoutes");
 const alarmRoutes = require("./routes/alarmRoutes");
+const authRoutes = require("./routes/authRoutes");
 
 const validateBreakerAction = require("./validators/breakerValidator");
 const requestLogger = require("./middleware/requestLogger");
 const errorHandler = require("./middleware/errorHandler");
+const authenticateToken = require("./middleware/authenticateToken");
 
 const scadaLogger = require("./utils/scadaLogger");
 const generateTelemetry = require("./simulator");
 const Alarm = require("./models/Alarm");
 const connectDB = require("./config/db");
 
-
 // APP INIT
-
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -44,9 +46,7 @@ const io = new Server(server, {
 
 app.set("io", io);
 
-
 // STATE
-
 let systemState = {
   breakerStatus: "Closed",
 };
@@ -54,9 +54,7 @@ let systemState = {
 const activeAlarms = {};
 let isShuttingDown = false;
 
-
 // MIDDLEWARE
-// CORS
 app.use(cors({
   origin: [
     "http://localhost:5173",
@@ -77,42 +75,29 @@ app.use(rateLimit({
 app.use(express.json());
 app.use(requestLogger);
 
-
 // SWAGGER
-
 app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
-
 // ROUTES
-
+app.use("/api/auth", authRoutes);
 app.use("/api/telemetry", telemetryRoutes);
 app.use("/api/alarms", alarmRoutes);
 
-
 // ROOT
-
 app.get("/", (req, res) => {
   res.json({ message: "PulseNode Backend Running" });
 });
 
+// BREAKER CONTROL (Protected by JWT)
+app.post("/control/breaker", authenticateToken, validateBreakerAction, (req, res) => {
+  const { action } = req.body;
 
-// BREAKER CONTROL
-
-app.post("/control/breaker", validateBreakerAction, (req, res) => {
-  const { action, password } = req.body;
-
-  if (password !== CONTROL_PASSWORD) {
-    return res.status(401).json({
-      message: "Invalid control password",
-    });
-  }
-
-  systemState.breakerStatus =
-    action === "OPEN" ? "Open" : "Closed";
+  systemState.breakerStatus = action === "OPEN" ? "Open" : "Closed";
 
   scadaLogger("BREAKER_STATE_CHANGE", {
     action,
     newState: systemState.breakerStatus,
+    changedBy: req.user.username // Logs which user made the change
   });
 
   io.emit("systemState", systemState);
@@ -123,19 +108,33 @@ app.post("/control/breaker", validateBreakerAction, (req, res) => {
   });
 });
 
-// SOCKET
+// SOCKET AUTHENTICATION MIDDLEWARE
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
 
-io.on("connection", (socket) => {
-  console.log("Client connected");
+  if (!token) {
+    return next(new Error("Authentication error: Token missing"));
+  }
 
-  socket.on("disconnect", () => {
-    console.log("Client disconnected");
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return next(new Error("Authentication error: Invalid token"));
+    }
+    socket.user = decoded; // Attach user info to the socket object
+    next();
   });
 });
 
+// SOCKET CONNECTION
+io.on("connection", (socket) => {
+  console.log(`Client connected: ${socket.user.username}`);
+
+  socket.on("disconnect", () => {
+    console.log(`Client disconnected: ${socket.user.username}`);
+  });
+});
 
 // SCADA LOOP
-
 const scadaInterval = setInterval(() => {
   const data = generateTelemetry(systemState);
 
@@ -172,9 +171,7 @@ const scadaInterval = setInterval(() => {
   }
 }, 2000);
 
-
 // ALARM ENGINE
-
 function triggerAlarm(key, payload) {
   if (activeAlarms[key]) return;
 
@@ -203,35 +200,35 @@ function clearAlarm(key) {
   scadaLogger("ALARM_CLEARED", { key });
 }
 
-
 // ERROR HANDLER
-
 app.use(errorHandler);
 
-
 // DB + SERVER START
-
 connectDB().then(() => {
   const PORT = process.env.PORT || 5000;
 
   server.listen(PORT, () => {
     console.log(`SCADA server running on port ${PORT}`);
   });
+
+  // --- AUTO-CREATE ADMIN USER (One-time setup) ---
+  const User = require("./models/User");
+  User.findOne({ username: "admin" }).then(user => {
+    if (!user) {
+      User.create({ username: "admin", password: "admin123", role: "admin" })
+        .then(() => console.log("✅ Default admin user created! Use 'admin' and 'admin123' to log in."))
+        .catch(err => console.error("Error creating admin:", err));
+    }
+  });
 });
 
-
 // GRACEFUL SHUTDOWN
-
 process.on("SIGINT", async () => {
   if (isShuttingDown) return;
   isShuttingDown = true;
-
   console.log("Shutting down SCADA system...");
-
   clearInterval(scadaInterval);
-
   io.close();
-
   server.close(async () => {
     try {
       const mongoose = require("mongoose");
@@ -239,7 +236,6 @@ process.on("SIGINT", async () => {
     } catch (err) {
       console.error("Mongo shutdown error:", err);
     }
-
     console.log("Server closed cleanly");
     process.exit(0);
   });
